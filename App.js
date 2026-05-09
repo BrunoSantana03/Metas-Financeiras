@@ -1,7 +1,11 @@
-import { useMemo, useState } from "react";
-import { SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Alert, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
 import { Feather } from "@expo/vector-icons";
+import { SQLiteProvider } from "expo-sqlite";
 import { StatusBar } from "expo-status-bar";
+import { migrate } from "./src/database/migrate";
+import { useTargetDatabase } from "./src/database/useTargetDatabase";
+import { useTransactionsDatabase } from "./src/database/useTransactionsDatabase";
 
 const colors = {
   white: "#FFFFFF",
@@ -24,22 +28,6 @@ const TransactionTypes = {
   DEPOSIT: "deposit",
   WITHDRAW: "withdraw"
 };
-
-const initialGoals = [
-  {
-    id: "apple-watch",
-    name: "Apple Watch",
-    target: 1790,
-    targetInput: "1.790,00",
-    transactions: [
-      { id: "t1", type: TransactionTypes.WITHDRAW, value: 20, date: "12/04/25" },
-      { id: "t2", type: TransactionTypes.DEPOSIT, value: 300, date: "12/04/25", note: "CDB de 110% no banco XPTO" },
-      { id: "t3", type: TransactionTypes.DEPOSIT, value: 300, date: "12/04/25", note: "CDB de 110% no banco XPTO" }
-    ]
-  },
-  { id: "chair", name: "Comprar uma cadeira ergonomica", target: 1200, targetInput: "1.200,00", transactions: [] },
-  { id: "rio-trip", name: "Fazer uma viagem para o Rio de Janeiro", target: 3000, targetInput: "3.000,00", transactions: [] }
-];
 
 function calculatePercent(current, target) {
   if (!target) {
@@ -71,11 +59,14 @@ function calculateTransactions(transactions) {
 }
 
 function hydrateGoal(goal) {
-  const transactionTotals = calculateTransactions(goal.transactions);
+  const transactions = goal.transactions ?? [];
+  const transactionTotals = calculateTransactions(transactions);
   const current = Math.max(0, transactionTotals.current);
 
   return {
     ...goal,
+    transactions,
+    targetInput: formatCurrencyInput(goal.target),
     current,
     incoming: transactionTotals.incoming,
     outgoing: transactionTotals.outgoing,
@@ -123,16 +114,15 @@ function parseCurrency(text) {
   return Number(clean) || 0;
 }
 
-function createId(prefix) {
-  return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1000)}`;
-}
+function formatSqliteDate(value) {
+  const date = String(value ?? "").split(" ")[0];
+  const [year, month, day] = date.split("-");
 
-function today() {
-  return new Date().toLocaleDateString("pt-BR", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "2-digit"
-  });
+  if (!year || !month || !day) {
+    return "";
+  }
+
+  return `${day}/${month}/${year.slice(-2)}`;
 }
 
 function Button({ title, iconName, variant = "primary", style, textStyle, onPress, disabled = false }) {
@@ -197,60 +187,98 @@ function ProgressBar({ percent }) {
   );
 }
 
+function normalizeTransaction(row) {
+  return {
+    id: row.id,
+    type: row.amount < 0 ? TransactionTypes.WITHDRAW : TransactionTypes.DEPOSIT,
+    value: Math.abs(row.amount),
+    date: formatSqliteDate(row.created_at),
+    note: row.observation ?? ""
+  };
+}
+
 export default function App() {
-  const [goalList, setGoalList] = useState(() => initialGoals.map(hydrateGoal));
+  return (
+    <Suspense fallback={<LoadingScreen />}>
+      <SQLiteProvider databaseName="target.db" onInit={migrate} useSuspense>
+        <MainApp />
+      </SQLiteProvider>
+    </Suspense>
+  );
+}
+
+function MainApp() {
+  const targetDatabase = useTargetDatabase();
+  const transactionsDatabase = useTransactionsDatabase();
+  const [goalList, setGoalList] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [databaseError, setDatabaseError] = useState("");
   const [route, setRoute] = useState({ name: "home" });
 
   const walletTotals = useMemo(() => calculateWalletTotals(goalList), [goalList]);
 
   const selectedGoal = useMemo(
-    () => goalList.find((goal) => goal.id === route.id) ?? goalList[0],
+    () => goalList.find((goal) => String(goal.id) === String(route.id)) ?? goalList[0],
     [goalList, route.id]
   );
 
   const goHome = () => setRoute({ name: "home" });
 
-  function saveGoal({ id, name, target, isEditing }) {
+  const loadGoals = useCallback(async () => {
+    try {
+      const targets = await targetDatabase.index();
+      const transactionsByTarget = await Promise.all(
+        targets.map((target) => transactionsDatabase.listByTargetId(target.id))
+      );
+
+      const goals = targets.map((target, index) =>
+        hydrateGoal({
+          id: target.id,
+          name: target.name,
+          target: target.target,
+          transactions: transactionsByTarget[index].map(normalizeTransaction)
+        })
+      );
+
+      setGoalList(goals);
+      setDatabaseError("");
+    } catch (error) {
+      console.log(error);
+      setDatabaseError("Nao foi possivel carregar os dados do SQLite.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [targetDatabase, transactionsDatabase]);
+
+  useEffect(() => {
+    loadGoals();
+  }, [loadGoals]);
+
+  async function saveGoal({ id, name, target, isEditing }) {
     const safeName = name.trim() || "Nova meta";
     const safeTarget = Math.max(0, target);
 
     if (isEditing) {
-      setGoalList((currentGoals) =>
-        currentGoals.map((goal) =>
-          goal.id === id
-            ? hydrateGoal({
-                ...goal,
-                name: safeName,
-                target: safeTarget,
-                targetInput: formatCurrencyInput(safeTarget)
-              })
-            : goal
-        )
-      );
+      await targetDatabase.update({ id: Number(id), name: safeName, amount: safeTarget });
+      await loadGoals();
       setRoute({ name: "progress", id });
       return;
     }
 
-    const newGoal = hydrateGoal({
-      id: createId("goal"),
-      name: safeName,
-      target: safeTarget,
-      targetInput: formatCurrencyInput(safeTarget),
-      transactions: []
-    });
-
-    setGoalList((currentGoals) => [...currentGoals, newGoal]);
-    setRoute({ name: "progress", id: newGoal.id });
+    const newGoalId = await targetDatabase.create({ name: safeName, amount: safeTarget });
+    await loadGoals();
+    setRoute({ name: "progress", id: newGoalId });
   }
 
-  function deleteGoal(id) {
-    setGoalList((currentGoals) => currentGoals.filter((goal) => goal.id !== id));
+  async function deleteGoal(id) {
+    await targetDatabase.remove(Number(id));
+    await loadGoals();
     goHome();
   }
 
-  function saveTransaction(goalId, transaction) {
+  async function saveTransaction(goalId, transaction) {
     const value = Math.max(0, transaction.value);
-    const goal = goalList.find((item) => item.id === goalId);
+    const goal = goalList.find((item) => String(item.id) === String(goalId));
 
     if (!value || !goal) {
       return false;
@@ -260,49 +288,40 @@ export default function App() {
       return false;
     }
 
-    const newTransaction = {
-      id: createId("transaction"),
-      type: transaction.type,
-      value,
-      date: today(),
-      note: transaction.note.trim()
-    };
+    try {
+      await transactionsDatabase.create({
+        target_id: Number(goalId),
+        amount: transaction.type === TransactionTypes.WITHDRAW ? value * -1 : value,
+        observation: transaction.note.trim()
+      });
 
-    setGoalList((currentGoals) =>
-      currentGoals.map((item) =>
-        item.id === goalId
-          ? hydrateGoal({
-              ...item,
-              transactions: [newTransaction, ...item.transactions]
-            })
-          : item
-      )
-    );
-
-    setRoute({ name: "progress", id: goalId });
-    return true;
+      await loadGoals();
+      setRoute({ name: "progress", id: goalId });
+      return true;
+    } catch (error) {
+      console.log(error);
+      return false;
+    }
   }
 
-  function removeTransaction(goalId, transactionId) {
-    const goal = goalList.find((item) => item.id === goalId);
-    const transaction = goal?.transactions.find((item) => item.id === transactionId);
+  async function removeTransaction(goalId, transactionId) {
+    const goal = goalList.find((item) => String(item.id) === String(goalId));
+    const transaction = goal?.transactions.find((item) => String(item.id) === String(transactionId));
 
     if (!goal || !transaction) {
       return;
     }
 
-    setGoalList((currentGoals) =>
-      currentGoals.map((item) => {
-        if (item.id !== goalId) {
-          return item;
-        }
+    await transactionsDatabase.remove(Number(transactionId));
+    await loadGoals();
+  }
 
-        return hydrateGoal({
-          ...item,
-          transactions: item.transactions.filter((entry) => entry.id !== transactionId)
-        });
-      })
-    );
+  if (isLoading) {
+    return <LoadingScreen />;
+  }
+
+  if (databaseError) {
+    return <MessageScreen message={databaseError} onRetry={loadGoals} />;
   }
 
   return (
@@ -346,6 +365,27 @@ export default function App() {
         />
       ) : null}
     </>
+  );
+}
+
+function LoadingScreen({ message = "Carregando..." }) {
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.centerContent}>
+        <Text style={styles.emptyText}>{message}</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function MessageScreen({ message, onRetry }) {
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.centerContent}>
+        <Text style={styles.errorText}>{message}</Text>
+        <Button title="Tentar novamente" style={styles.retryButton} onPress={onRetry} />
+      </View>
+    </SafeAreaView>
   );
 }
 
@@ -407,6 +447,13 @@ function HomeScreen({ goals, totals, onNewGoal, onGoalPress }) {
 }
 
 function ProgressScreen({ goal, onBack, onEdit, onNewTransaction, onRemoveTransaction }) {
+  function handleTransactionRemove(transactionId) {
+    Alert.alert("Remover", "Deseja realmente remover essa transacao?", [
+      { text: "Nao", style: "cancel" },
+      { text: "Sim", onPress: () => onRemoveTransaction(transactionId) }
+    ]);
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.content}>
@@ -450,7 +497,7 @@ function ProgressScreen({ goal, onBack, onEdit, onNewTransaction, onRemoveTransa
                     {transaction.note ? ` - ${transaction.note}` : ""}
                   </Text>
                 </View>
-                <TouchableOpacity activeOpacity={0.7} onPress={() => onRemoveTransaction(transaction.id)} style={styles.removeButton}>
+                <TouchableOpacity activeOpacity={0.7} onPress={() => handleTransactionRemove(transaction.id)} style={styles.removeButton}>
                   <Feather name="x" size={16} color={colors.gray500} />
                 </TouchableOpacity>
               </View>
@@ -471,8 +518,9 @@ function TransactionScreen({ goal, onBack, onSave }) {
   const [amount, setAmount] = useState("50,00");
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
 
-  function handleSave() {
+  async function handleSave() {
     const value = parseCurrency(amount);
 
     if (value <= 0) {
@@ -486,7 +534,9 @@ function TransactionScreen({ goal, onBack, onSave }) {
     }
 
     setError("");
-    const saved = onSave({ type, value, note });
+    setIsSaving(true);
+    const saved = await onSave({ type, value, note });
+    setIsSaving(false);
 
     if (!saved) {
       setError("Nao foi possivel salvar essa transacao.");
@@ -524,7 +574,7 @@ function TransactionScreen({ goal, onBack, onSave }) {
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-        <Button title="Salvar" style={styles.saveButton} onPress={handleSave} />
+        <Button title={isSaving ? "Salvando..." : "Salvar"} style={styles.saveButton} onPress={handleSave} disabled={isSaving} />
       </View>
     </SafeAreaView>
   );
@@ -534,8 +584,9 @@ function TargetScreen({ goal, isEditing, onBack, onDelete, onSave }) {
   const [name, setName] = useState(isEditing ? goal?.name ?? "" : "");
   const [targetInput, setTargetInput] = useState(isEditing ? goal?.targetInput ?? "0,00" : "0,00");
   const [error, setError] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
 
-  function handleSave() {
+  async function handleSave() {
     const target = parseCurrency(targetInput);
 
     if (target <= 0) {
@@ -544,13 +595,29 @@ function TargetScreen({ goal, isEditing, onBack, onDelete, onSave }) {
     }
 
     setError("");
-    onSave({ name, target });
+    setIsSaving(true);
+
+    try {
+      await onSave({ name, target });
+    } catch (error) {
+      console.log(error);
+      setError("Nao foi possivel salvar a meta.");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function handleDelete() {
+    Alert.alert("Remover", "Deseja realmente remover essa meta?", [
+      { text: "Nao", style: "cancel" },
+      { text: "Sim", onPress: () => onDelete?.() }
+    ]);
   }
 
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.content}>
-        <Header onBack={onBack} rightIconName={isEditing ? "trash-2" : undefined} onRightPress={onDelete} />
+        <Header onBack={onBack} rightIconName={isEditing ? "trash-2" : undefined} onRightPress={handleDelete} />
 
         {isEditing ? (
           <>
@@ -566,7 +633,7 @@ function TargetScreen({ goal, isEditing, onBack, onDelete, onSave }) {
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-        <Button title="Salvar" style={styles.saveButton} onPress={handleSave} />
+        <Button title={isSaving ? "Salvando..." : "Salvar"} style={styles.saveButton} onPress={handleSave} disabled={isSaving} />
       </View>
     </SafeAreaView>
   );
@@ -574,6 +641,7 @@ function TargetScreen({ goal, isEditing, onBack, onDelete, onSave }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.white },
+  centerContent: { flex: 1, paddingHorizontal: 24, alignItems: "center", justifyContent: "center" },
   summary: { height: 330, paddingHorizontal: 26, paddingTop: 108, backgroundColor: colors.primaryDark },
   smallText: { color: "rgba(255, 255, 255, 0.76)", fontSize: 12 },
   balance: { marginTop: 6, color: colors.white, fontSize: 32 },
@@ -622,6 +690,7 @@ const styles = StyleSheet.create({
   segment: { marginTop: 22, minHeight: 46, borderRadius: 6, backgroundColor: colors.gray100, flexDirection: "row", padding: 2 },
   segmentButton: { flex: 1, height: 42 },
   saveButton: { marginTop: 28 },
+  retryButton: { width: "100%", marginTop: 20 },
   intro: { marginTop: 78, color: colors.gray500, fontSize: 13 },
   errorText: { marginTop: 14, color: colors.negative, fontSize: 12 }
 });
